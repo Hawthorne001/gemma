@@ -4,20 +4,22 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ============================================================================
+
 """Sampler for Gemma transformer.
 
 An example of a sampling class for a Gemma model.
 """
+
 from collections.abc import Sequence
 import dataclasses
+import warnings
 
 import chex
 from gemma import modules
@@ -35,22 +37,32 @@ def _compute_attention_masks(
   """Computes causal attention mask."""
   bsz = input_mask.shape[0]
   batch_time_step = jnp.full((bsz, 1), time_step, dtype=jnp.uint32)
-  causal_padding = jnp.greater(
+  causal_mask = jnp.less_equal(
       jnp.expand_dims(jnp.arange(seq_len), 0), batch_time_step
   )
-  causal_padding = causal_padding * jnp.expand_dims(input_mask, axis=-1)
-  attention_mask = causal_padding[:, jnp.newaxis, jnp.newaxis, :].astype(
-      jnp.bool_
+  max_seq_len = min(input_mask.shape[-1], seq_len)
+  input_mask = jax.lax.dynamic_slice(
+      input_mask,
+      (0, jnp.maximum(time_step - seq_len + 1, 0)),
+      (bsz, max_seq_len),
   )
-  attention_mask = jnp.squeeze(attention_mask, axis=1)
-  return ~attention_mask
+  input_mask = (
+      jnp.ones((bsz, seq_len), dtype=jnp.bool_)
+      .at[:, :max_seq_len]
+      .set(input_mask)
+  )
+
+  causal_mask = jnp.logical_and(causal_mask, input_mask)
+  attention_mask = causal_mask[:, jnp.newaxis, :].astype(jnp.bool_)
+
+  return attention_mask
 
 
 @chex.dataclass
 class _SamplingState:
   """Internal sampling state."""
 
-  # Decoding step
+  # Decoding step.
   decoding_step: jnp.int32
 
   # Number of tokens in the prompt.
@@ -59,17 +71,23 @@ class _SamplingState:
   # Fixed-size buffer for accumulating the output tokens.
   token_buffer: jnp.ndarray  # [B, L]
 
+  # Position indices, based on ignoring pad tokens.
+  positions: jnp.ndarray  # [B, L]
+
   # Model state for conditioning the model on autoregressively.
   cache: dict[str, modules.LayerCache]
 
-  # Is decoding done on the given sequence
+  # Is decoding done on the given sequence?
   done: jnp.ndarray  # [B]
 
-  # Total sampling steps (including the prompt)
+  # Total sampling steps (including the prompt).
   total_sampling_steps: int
 
   # Fixed-size buffer for accumulating the output logits.
   logits_buffer: jnp.ndarray | None = None  # [B, L, V]
+
+  # List of tokens that are forbidden to be generated.
+  forbidden_token_ids: Sequence[int] | None = None
 
 
 @dataclasses.dataclass
@@ -93,6 +111,8 @@ class Sampler:
       transformer: transformer_lib.Transformer,
       vocab: spm.SentencePieceProcessor,
       params: params_lib.Params,
+      *,
+      cache_length: int | None = None,
   ):
     """Initializes a sampler for a Gemma model.
 
@@ -100,11 +120,22 @@ class Sampler:
       transformer: an instance of the Gemma transformer.
       vocab: vocabulary of the given model.
       params: weights of the model.
+      cache_length: Max length of the cache.
     """
     self.transformer = transformer
     self.vocab = vocab
     self.params = params
     self._compiled_sample_fn = jax.jit(self._sample_fn)
+    if cache_length is None:
+      warnings.warn(
+          'TransformerConfig.max_cache_length is deprecated and will be'
+          ' REMOVED!!! Instead, set the `cache_length` in the `Sampler` class.',
+          DeprecationWarning,
+          stacklevel=2,
+      )
+    self.cache_length = cache_length or transformer.config.max_cache_length
+    if self.cache_length is None:
+      raise ValueError('Sampler `cache_length` should be set.')
 
   @property
   def dtype(self) -> jnp.dtype:
@@ -117,20 +148,24 @@ class Sampler:
     batch_size = sampler_state.token_buffer.shape[0]
     decoding_step = jnp.asarray(sampler_state.decoding_step, dtype=jnp.int32)
     last_token = sampler_state.token_buffer[:, decoding_step]
-    input_mask = last_token != self.vocab.pad_id()
+    input_mask = sampler_state.token_buffer != self.vocab.pad_id()
     attention_mask = _compute_attention_masks(
-        decoding_step, self.transformer.config.max_cache_length, input_mask
+        decoding_step, self.cache_length, input_mask
     )
-    positions = jnp.full((batch_size, 1), decoding_step, dtype=jnp.int32)
+    step_positions = jnp.expand_dims(
+        sampler_state.positions[:, decoding_step], -1
+    )
     last_token = last_token.reshape((batch_size, 1))
 
     logits, cache = self.transformer.apply(
         {'params': params},
         last_token,
-        positions,
+        step_positions,
         sampler_state.cache,
         attention_mask,
     )
+    if sampler_state.forbidden_token_ids:
+      logits = logits.at[:, :, sampler_state.forbidden_token_ids].set(-jnp.inf)
 
     next_token_candidate = jnp.argmax(logits, axis=-1)  # [B, 1]
     next_token_candidate = next_token_candidate[:, 0]  # [B,]
@@ -161,21 +196,28 @@ class Sampler:
         decoding_step=sampler_state.decoding_step + 1,
         num_input_tokens=sampler_state.num_input_tokens,
         token_buffer=token_buffer,
+        positions=sampler_state.positions,
         logits_buffer=logits_buffer,
         cache=cache,
         done=done,
         total_sampling_steps=sampler_state.total_sampling_steps,
+        forbidden_token_ids=sampler_state.forbidden_token_ids,
     )
 
   def init_cache(self, bsz) -> dict[str, modules.LayerCache]:
     """Initializes the attention cache for each layer."""
-    return self.transformer.config.init_cache(bsz, dtype=self.dtype)
+    return self.transformer.config.init_cache(
+        bsz,
+        dtype=self.dtype,
+        cache_length=self.cache_length,
+    )
 
   def init_sample_state(
       self,
       all_input_ids: list[jax.Array],
       total_sampling_steps: int,
       include_logits: bool = False,
+      forbidden_token_ids: Sequence[int] | None = None,
   ) -> _SamplingState:
     """Initializes the sampling state given input prompts."""
     bsz = len(all_input_ids)
@@ -190,10 +232,15 @@ class Sampler:
         self.vocab.pad_id(),
         dtype=jnp.int32,
     )
+    input_mask = jnp.ones_like(token_buffer, dtype=jnp.bool_)
     for i, (input_ids, num_tokens) in enumerate(
         zip(all_input_ids, num_input_tokens)
     ):
       token_buffer = token_buffer.at[i, :num_tokens].set(input_ids)
+      input_mask = input_mask.at[i, :num_tokens].set(
+          input_ids != self.vocab.pad_id()
+      )
+    positions = transformer_lib.build_positions_from_mask(input_mask)
 
     done = jnp.zeros((bsz,), dtype=jnp.bool_)
 
@@ -209,10 +256,12 @@ class Sampler:
         decoding_step=0,
         num_input_tokens=jnp.array(num_input_tokens, dtype=jnp.int32),
         token_buffer=token_buffer,
+        positions=positions,
         logits_buffer=logits_buffer,
         cache=self.init_cache(bsz),
         done=done,
         total_sampling_steps=total_sampling_steps,
+        forbidden_token_ids=forbidden_token_ids,
     )
 
   def tokenize(self, input_string: str) -> jax.Array:
@@ -222,6 +271,22 @@ class Sampler:
         [self.vocab.bos_id()] + jnp.array(input_ids).tolist(), dtype=jnp.int32
     )
     return input_ids
+
+  def mask_tokens_after_eos_ids(self, token_buffer):
+    """Mask token IDs after the EOS token with the padding ID."""
+    eos_id = self.vocab.eos_id()
+    eos_exists = jnp.any(jnp.equal(token_buffer, eos_id), axis=-1)
+    eos_indices = jnp.where(
+        eos_exists,
+        jnp.argmax(jnp.equal(token_buffer, eos_id), axis=-1),
+        token_buffer.shape[-1],
+    )
+    mask = jnp.less_equal(
+        jnp.arange(token_buffer.shape[-1]), eos_indices[:, None]
+    )
+    masked_token_buffer = token_buffer * mask + self.vocab.pad_id()*(1 - mask)
+
+    return masked_token_buffer
 
   def _sample_fn(
       self,
@@ -248,20 +313,33 @@ class Sampler:
       total_generation_steps: int,
       echo: bool = False,
       return_logits: bool = True,
+      forbidden_tokens: Sequence[str] | None = None,
   ) -> SamplerOutput:
     """Samples a completion of the input string.
 
     Args:
       input_strings: input prompts to feed to the model for sampling.
       total_generation_steps: number of generation steps. will correspond to the
-      longest prompt in the batch.
+        longest prompt in the batch.
       echo: whether to return the prompt as part of the output sample.
       return_logits: whether to return per-step logits used during generation.
+      forbidden_tokens: list of tokens that are forbidden to be generated. Each
+        token must map to a single token id in the vocab.
 
     Returns:
       sampler_output: A SamplerOutput object containing the generated samples.
     """
-
+    forbidden_token_ids = None
+    if forbidden_tokens is not None:
+      forbidden_token_ids = []
+      for token in forbidden_tokens:
+        token_id = self.vocab.EncodeAsIds(token)
+        if len(token_id) != 1:
+          raise ValueError(
+              'Forbidden tokens must map to single token ids in the vocab.'
+          )
+        forbidden_token_ids.extend(token_id)
+      forbidden_token_ids = tuple(forbidden_token_ids)
     all_input_ids = [self.tokenize(x) for x in input_strings]
     max_input_length = max(len(input_ids) for input_ids in all_input_ids)
     total_sampling_steps = max_input_length + total_generation_steps
@@ -269,17 +347,22 @@ class Sampler:
         all_input_ids,
         include_logits=return_logits,
         total_sampling_steps=total_sampling_steps,
+        forbidden_token_ids=forbidden_token_ids,
     )
 
     sampling_state = self._compiled_sample_fn(
         self.params, initial_sampling_state
     )
 
+    masked_token_buffer = self.mask_tokens_after_eos_ids(
+        sampling_state.token_buffer
+    )
+
     out_tokens = []
     out_logits = []
     for i, (token_buffer, num_tokens) in enumerate(
         zip(
-            sampling_state.token_buffer,
+            masked_token_buffer,
             sampling_state.num_input_tokens,
         )
     ):
@@ -291,9 +374,7 @@ class Sampler:
             logits_buffer[start_idx:total_sampling_steps].tolist()
         )
 
-    decoded_outputs = [
-        self.vocab.DecodeIds(tokens) for tokens in out_tokens
-    ]
+    decoded_outputs = [self.vocab.DecodeIds(tokens) for tokens in out_tokens]
 
     result = SamplerOutput(
         text=decoded_outputs,

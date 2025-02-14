@@ -4,16 +4,17 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ============================================================================
+
 """Transformer sub-modules."""
 
+import enum
 from flax import linen as nn
 from gemma import layers
 from gemma import positional_embeddings
@@ -21,7 +22,45 @@ import jax
 import jax.numpy as jnp
 
 K_MASK = -2.3819763e38  # Set to a large negative number.
+DEFAULT_ROPE_BASE_FREQUENCY = 10_000
 LayerCache = dict[str, jax.Array]
+
+
+def _create_sliding_mask(
+    segment_pos: jnp.ndarray,
+    end_index: int,
+    cache_len: int,
+    sliding_window_size: int,
+):
+  """Creates mask for sliding window attention."""
+  total_tokens = end_index + segment_pos.shape[1]  # cached + processing tokens
+
+  def _reconstruct_rotated_cache_positions():
+    cache_positions = jnp.arange(cache_len) + total_tokens - cache_len
+    cache_positions = (
+        jnp.zeros_like(cache_positions)
+        # kv were placed at index (position_id % cache_len) in the cache.
+        .at[cache_positions % cache_len].set(cache_positions)
+    )
+    return cache_positions
+
+  # Reconstruct position_ids for cached kv.
+  cache_positions = jax.lax.cond(
+      total_tokens <= cache_len,
+      lambda: jnp.arange(cache_len),
+      _reconstruct_rotated_cache_positions,
+  )
+
+  cache_positions = cache_positions[None, None, :]  # [1, 1, cache_len]
+  segment_pos = segment_pos[:, :, None]  # [B, seq_len, 1]
+  sliding_mask = (cache_positions > segment_pos - sliding_window_size)
+  sliding_mask *= (cache_positions < segment_pos + sliding_window_size)
+  return sliding_mask
+
+
+class AttentionType(enum.Enum):
+  GLOBAL = 1
+  LOCAL_SLIDING = 2
 
 
 class Embedder(nn.Module):
@@ -53,10 +92,20 @@ class Attention(nn.Module):
   num_kv_heads: int
   features: int
   head_dim: int
+  attn_type: AttentionType
+  query_pre_attn_scalar: float
+  rope_base_frequency: int = DEFAULT_ROPE_BASE_FREQUENCY
+  attn_logits_soft_cap: float | None = None
+  sliding_window_size: int | None = None
+  use_qk_norm: bool = False
 
   @property
   def use_qkv_einsum(self):
     return self.num_kv_heads == self.num_heads
+
+  @property
+  def use_gqa(self):
+    return self.num_kv_heads != self.num_heads and self.num_kv_heads > 1
 
   def setup(self):
     self.attn_vec_einsum = layers.Einsum(
@@ -74,6 +123,9 @@ class Attention(nn.Module):
       self.kv_einsum = layers.Einsum(
           shape=(2, self.num_kv_heads, self.features, self.head_dim),
       )
+    if self.use_qk_norm:
+      self._query_norm = layers.RMSNorm()
+      self._key_norm = layers.RMSNorm()
 
   def __call__(
       self,
@@ -90,21 +142,22 @@ class Attention(nn.Module):
       query_proj = self.q_einsum('BTD,NDH->BTNH', x)
       key_proj, value_proj = self.kv_einsum('BSD,CKDH->CBSKH', x)
 
+    if self.use_qk_norm:
+      query_proj = self._query_norm(query_proj)
+      key_proj = self._key_norm(key_proj)
+
     query_proj = positional_embeddings.apply_rope(
         query_proj,
         segment_pos,
-        head_dim=self.head_dim,
+        base_frequency=self.rope_base_frequency,
     )
-    query_scaled = query_proj * self.head_dim**-0.5
+    query_scaled = query_proj * self.query_pre_attn_scalar
     key_proj = positional_embeddings.apply_rope(
         key_proj,
         segment_pos,
-        head_dim=self.head_dim,
+        base_frequency=self.rope_base_frequency,
     )
 
-    if not self.use_qkv_einsum:
-      value_proj = jnp.repeat(value_proj, self.num_heads, axis=-2)
-      key_proj = jnp.repeat(key_proj, self.num_heads, axis=-2)
     # Cache is left aligned.
     if cache is not None:
       end_index = cache['end_index'][0]
@@ -118,12 +171,49 @@ class Attention(nn.Module):
           cache['k'], key_proj, slice_indices
       )
 
-    logits = jnp.einsum('BTNH,BSNH->BTNS', query_scaled, key_proj)
-    padded_logits = jnp.where(
-        (jnp.expand_dims(attn_mask, -2)), logits, K_MASK
-    )
+    if self.use_gqa:
+      # Reshape matrices to enable einsums over groups.
+      b, t, kg, h = query_scaled.shape
+      query_scaled = query_scaled.reshape(
+          (b, t, self.num_kv_heads, int(kg / self.num_kv_heads), h)
+      )
+      logits = jnp.einsum('BTKGH,BSKH->BTKGS', query_scaled, key_proj)
+      b, t, k, g, s = logits.shape
+      logits = logits.reshape((b, t, k * g, s))
+    else:
+      logits = jnp.einsum('BTNH,BSNH->BTNS', query_scaled, key_proj)
+
+    if self.attn_logits_soft_cap is not None:
+      logits = jnp.tanh(logits / self.attn_logits_soft_cap)
+      logits = logits * self.attn_logits_soft_cap
+
+    if self.attn_type == AttentionType.LOCAL_SLIDING:
+      if self.sliding_window_size is None:
+        raise ValueError(
+            'Sliding_window_size must be set if Local Sliding attention type'
+        )
+      sliding_mask = _create_sliding_mask(
+          segment_pos,
+          end_index=cache['end_index'][0] if cache is not None else 0,
+          # Derive cache length from attn_mask shape in case cache is None
+          cache_len=attn_mask.shape[-1],
+          sliding_window_size=self.sliding_window_size,
+      )
+      attn_mask *= sliding_mask
+
+    padded_logits = jnp.where((jnp.expand_dims(attn_mask, -2)), logits, K_MASK)
     probs = jax.nn.softmax(padded_logits, axis=-1).astype(key_proj.dtype)
-    encoded = jnp.einsum('BTNS,BSNH->BTNH', probs, value_proj)
+    if self.use_gqa:
+      # Reshape matrices to enable einsums over groups.
+      b, t, kg, h = probs.shape
+      probs = probs.reshape(
+          (b, t, self.num_kv_heads, int(kg / self.num_kv_heads), h)
+      )
+      encoded = jnp.einsum('BTKGS,BSKH->BTKGH', probs, value_proj)
+      b, t, k, g, h = encoded.shape
+      encoded = encoded.reshape((b, t, k * g, h))
+    else:
+      encoded = jnp.einsum('BTNS,BSNH->BTNH', probs, value_proj)
     attn_output = self.attn_vec_einsum('BTNH,NHD->BTD', encoded)
 
     if cache is not None:
@@ -163,26 +253,38 @@ class FeedForward(nn.Module):
 
   features: int
   hidden_dim: int
+  transpose_gating_einsum: bool
 
   @nn.compact
   def __call__(self, x):
-    w_gating = self.param(
-        'gating_einsum',
-        nn.initializers.zeros_init(),
-        ((2, self.features, self.hidden_dim)),
-    )
-    ff_gate = jnp.dot(x, w_gating[0])
-    gate_value = nn.gelu(ff_gate)
+    # Some versions use an alternate parameter ordering that
+    # transposes hidden_dim and features.
+    if self.transpose_gating_einsum:
+      eq = '...F,NHF->...NH'
+      gating = layers.Einsum(
+          shape=(2, self.hidden_dim, self.features),
+          weight_name='gating_einsum',
+      )
+    else:
+      eq = '...F,NFH->...NH'
+      gating = layers.Einsum(
+          shape=(2, self.features, self.hidden_dim),
+          weight_name='gating_einsum',
+      )
 
-    ff1 = jnp.dot(x, w_gating[1])
-    activations = gate_value * ff1
+    # Use the same scope for backwards compatibility with existing checkpoints
+    # created before using `layers.Einsum` here.
+    nn.share_scope(self, gating)
+    gate = gating(eq, x)
+    activations = nn.gelu(gate[..., 0, :]) * gate[..., 1, :]
 
-    w_linear = self.param(
-        'linear',
-        nn.initializers.zeros_init(),
-        (self.hidden_dim, self.features),
+    # Down projection
+    linear = layers.Einsum(
+        shape=(self.hidden_dim, self.features),
+        weight_name='linear',
     )
-    outputs = jnp.dot(activations, w_linear)
+    nn.share_scope(self, linear)
+    outputs = linear('...H,HF->...F', activations)
 
     return outputs
 
@@ -195,6 +297,15 @@ class Block(nn.Module):
   embed_dim: int
   head_dim: int
   hidden_dim: int
+  use_post_attn_norm: bool
+  use_post_ffw_norm: bool
+  attn_type: AttentionType
+  query_pre_attn_scalar: float
+  transpose_gating_einsum: bool
+  rope_base_frequency: int = DEFAULT_ROPE_BASE_FREQUENCY
+  attn_logits_soft_cap: float | None = None
+  sliding_window_size: int | None = None
+  use_qk_norm: bool = False
 
   def setup(self):
     self.pre_attention_norm = layers.RMSNorm()
@@ -203,9 +314,26 @@ class Block(nn.Module):
         features=self.embed_dim,
         head_dim=self.head_dim,
         num_kv_heads=self.num_kv_heads,
+        attn_type=self.attn_type,
+        query_pre_attn_scalar=self.query_pre_attn_scalar,
+        rope_base_frequency=self.rope_base_frequency,
+        attn_logits_soft_cap=self.attn_logits_soft_cap,
+        sliding_window_size=self.sliding_window_size,
+        use_qk_norm=self.use_qk_norm,
     )
+    self.post_attention_norm = None
+    if self.use_post_attn_norm:
+      self.post_attention_norm = layers.RMSNorm()
+
     self.pre_ffw_norm = layers.RMSNorm()
-    self.mlp = FeedForward(features=self.embed_dim, hidden_dim=self.hidden_dim)
+    self.mlp = FeedForward(
+        features=self.embed_dim,
+        hidden_dim=self.hidden_dim,
+        transpose_gating_einsum=self.transpose_gating_einsum,
+    )
+    self.post_ffw_norm = None
+    if self.use_post_ffw_norm:
+      self.post_ffw_norm = layers.RMSNorm()
 
   def __call__(
       self,
@@ -221,9 +349,12 @@ class Block(nn.Module):
         cache,
         attn_mask,
     )
+    if self.post_attention_norm is not None:
+      attn_output = self.post_attention_norm(attn_output)
     attn_output += x
-    residual = attn_output
-    attn_output = self.pre_ffw_norm(attn_output)
-    outputs = self.mlp(attn_output)
-    outputs = residual + outputs
+    outputs = self.pre_ffw_norm(attn_output)
+    outputs = self.mlp(outputs)
+    if self.post_ffw_norm is not None:
+      outputs = self.post_ffw_norm(outputs)
+    outputs += attn_output
     return cache, outputs
